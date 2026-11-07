@@ -1,0 +1,15 @@
+config/device.env
+config/accounts.env
+.droid/
+runs/*
+!runs/.gitkeep
+test-cases/*
+!test-cases/.gitkeep
+!test-cases/EXEMPLO.md
+charters/*
+!charters/.gitkeep
+.claude/settings.local.json
+*.mp4
+*.webm
+__pycache__/
+*.env

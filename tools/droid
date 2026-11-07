@@ -1,0 +1,638 @@
+#!/usr/bin/env python3
+"""droid — CLI de apoio para testes manuais/assistidos por IA em device Android via adb.
+
+Só usa a biblioteca padrão do Python. Tudo o que altera o device é registrado em
+.droid/state.json e pode ser desfeito com `droid restore`.
+
+Uso rápido:
+  droid doctor                      verifica adb, device, autorização e config
+  droid run new <slug>              cria runs/AAAA-MM-DD_<slug>/ e marca como run atual
+  droid prep | restore              prepara o device (DND, tela acesa, toques visíveis) / desfaz tudo
+  droid info [--out DIR]            dados do device + versão do app (About Device)
+  droid shot <arquivo.png>          screenshot
+  droid ui [--all] [--grep TXT]     lista elementos da tela (uiautomator) com índice e centro
+  droid tap X Y | tap-el N          toque por coordenada / pelo índice do último `droid ui`
+  droid swipe X1 Y1 X2 Y2 [ms]      swipe
+  droid text "abc"                  digita texto ASCII (acentos: use o MCP ou o teclado)
+  droid key BACK|HOME|APP_SWITCH|ENTER|POWER|VOLUME_UP|...  tecla
+  droid launch [pkg] | stop [pkg] | clear [pkg] | bg [pkg] | kill-bg [pkg]
+  droid focus                       activity em foco
+  droid rec start <arq.mp4> [--limit 180] | rec stop
+  droid log start [arq.log] | log stop | crashes
+  droid set dark on|off | font 1.3|reset | battery 15|reset | rotate 0|1|2|3|auto | anim off|reset
+  droid perm grant|revoke <permissão> [pkg]
+  droid note "texto" [--step DIR]   anota com data/hora/fuso no notes.md
+"""
+import json
+import os
+import re
+import shlex
+import signal
+import subprocess
+import sys
+import time
+import xml.etree.ElementTree as ET
+from datetime import datetime
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+STATE_DIR = ROOT / ".droid"
+STATE_FILE = STATE_DIR / "state.json"
+CONFIG_FILE = ROOT / "config" / "device.env"
+
+
+# ---------------------------------------------------------------- config/state
+def load_config():
+    cfg = {}
+    if CONFIG_FILE.exists():
+        for line in CONFIG_FILE.read_text().splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            cfg[k.strip()] = v.strip().strip('"').strip("'")
+    for k in ("ANDROID_SERIAL", "TARGET_PACKAGES", "MUTE_MEDIA", "USE_DND", "SHOW_TOUCHES", "RUN_TZ"):
+        if os.environ.get(k):
+            cfg[k] = os.environ[k]
+    return cfg
+
+
+CFG = load_config()
+
+
+def targets():
+    return [p.strip() for p in CFG.get("TARGET_PACKAGES", "").split(",") if p.strip()]
+
+
+def default_pkg(arg=None):
+    if arg:
+        return arg
+    t = targets()
+    if not t:
+        die("Informe o pacote ou defina TARGET_PACKAGES em config/device.env")
+    return t[0]
+
+
+def load_state():
+    if STATE_FILE.exists():
+        return json.loads(STATE_FILE.read_text())
+    return {}
+
+
+def save_state(st):
+    STATE_DIR.mkdir(exist_ok=True)
+    STATE_FILE.write_text(json.dumps(st, indent=2, ensure_ascii=False))
+
+
+def die(msg, code=1):
+    print(f"ERRO: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def now_str():
+    return datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z (UTC%z)")
+
+
+# ------------------------------------------------------------------------- adb
+def adb_base():
+    base = ["adb"]
+    if CFG.get("ANDROID_SERIAL"):
+        base += ["-s", CFG["ANDROID_SERIAL"]]
+    return base
+
+
+def adb(*args, check=True, binary=False, timeout=60):
+    r = subprocess.run(adb_base() + list(args), capture_output=True, timeout=timeout)
+    if check and r.returncode != 0:
+        die(f"adb {' '.join(args)} falhou: {r.stderr.decode(errors='replace').strip()}")
+    return r.stdout if binary else r.stdout.decode(errors="replace")
+
+
+def sh(cmd, check=True, timeout=60):
+    return adb("shell", cmd, check=check, timeout=timeout).strip()
+
+
+def getprop(p):
+    return sh(f"getprop {p}", check=False)
+
+
+def setting_get(ns, key):
+    v = sh(f"settings get {ns} {key}", check=False)
+    return None if v in ("null", "") else v
+
+
+def setting_put(ns, key, value):
+    if value is None:
+        sh(f"settings delete {ns} {key}", check=False)
+    else:
+        sh(f"settings put {ns} {key} {value}", check=False)
+
+
+def remember(key, value):
+    """Guarda o valor original só na primeira vez (para o restore)."""
+    st = load_state()
+    orig = st.setdefault("originals", {})
+    if key not in orig:
+        orig[key] = value
+        save_state(st)
+
+
+# ------------------------------------------------------------------------ runs
+def current_run():
+    st = load_state()
+    p = st.get("current_run")
+    return Path(p) if p else None
+
+
+def cmd_run(args):
+    if not args or args[0] not in ("new", "use", "show"):
+        die("uso: droid run new <slug> | use <pasta> | show")
+    st = load_state()
+    if args[0] == "show":
+        print(st.get("current_run", "(nenhuma)"))
+        return
+    if args[0] == "use":
+        p = (ROOT / args[1]).resolve() if not Path(args[1]).is_absolute() else Path(args[1])
+        if not p.is_dir():
+            die(f"pasta não existe: {p}")
+    else:
+        slug = re.sub(r"[^a-z0-9-]+", "-", " ".join(args[1:]).lower()).strip("-") or "run"
+        p = ROOT / "runs" / f"{datetime.now():%Y-%m-%d}_{slug}"
+        for sub in ("evidence", "evidence/bugs", "snap", "logs", "bug-reports"):
+            (p / sub).mkdir(parents=True, exist_ok=True)
+        tpl = ROOT / "templates" / "run-readme.md"
+        if tpl.exists() and not (p / "README.md").exists():
+            (p / "README.md").write_text(tpl.read_text().replace("{{RUN}}", p.name).replace("{{DATE}}", now_str()))
+    st["current_run"] = str(p)
+    save_state(st)
+    print(p)
+
+
+# ---------------------------------------------------------------------- doctor
+def cmd_doctor(_):
+    ok = True
+    r = subprocess.run(["adb", "version"], capture_output=True, text=True)
+    print("adb:", r.stdout.splitlines()[0] if r.returncode == 0 else "NÃO ENCONTRADO")
+    out = subprocess.run(["adb", "devices", "-l"], capture_output=True, text=True).stdout
+    devs = [l for l in out.splitlines()[1:] if l.strip()]
+    if not devs:
+        print("✗ Nenhum device. Ative Depuração USB (ou Depuração por Wi-Fi) e conecte.")
+        return 1
+    for d in devs:
+        print("  ", d)
+    if any(" unauthorized" in d for d in devs):
+        print("✗ Device 'unauthorized': desbloqueie o celular e aceite a chave RSA.")
+        ok = False
+    ready = [d.split()[0] for d in devs if " device " in d + " "]
+    if len(ready) > 1 and not CFG.get("ANDROID_SERIAL"):
+        print("✗ Mais de um device: defina ANDROID_SERIAL em config/device.env")
+        return 1
+    if not ready:
+        return 1
+    print(f"✓ Device: {getprop('ro.product.manufacturer')} {getprop('ro.product.model')} — "
+          f"Android {getprop('ro.build.version.release')} (API {getprop('ro.build.version.sdk')})")
+    if not CONFIG_FILE.exists():
+        print("! config/device.env não existe (copie de config/device.env.example)")
+    t = targets()
+    if not t:
+        print("! TARGET_PACKAGES vazio: o guard só permite ações destrutivas em pacotes-alvo.")
+    for p in t:
+        v = app_version(p)
+        print(f"  {'✓' if v else '✗'} {p}: {v or 'não instalado'}")
+    lock = sh("dumpsys window | grep -E 'mDreamingLockscreen|isKeyguardShowing|mShowingLockscreen' | head -3", check=False)
+    if "true" in lock.lower():
+        print("! O device parece estar bloqueado. Desbloqueie antes de testar.")
+    print("✓ Tudo pronto." if ok else "Corrija os itens acima.")
+    return 0 if ok else 1
+
+
+# ------------------------------------------------------------------- info/app
+def app_version(pkg):
+    out = sh(f"dumpsys package {shlex.quote(pkg)}", check=False)
+    vn = re.search(r"versionName=(\S+)", out)
+    vc = re.search(r"versionCode=(\d+)", out)
+    if not vn:
+        return None
+    return f"{vn.group(1)} (versionCode {vc.group(1) if vc else '?'})"
+
+
+def cmd_info(args):
+    out_dir = None
+    if "--out" in args:
+        out_dir = Path(args[args.index("--out") + 1])
+    size = sh("wm size", check=False).split(":")[-1].strip()
+    dens = sh("wm density", check=False).split(":")[-1].strip()
+    batt = sh("dumpsys battery", check=False)
+    lvl = re.search(r"level: (\d+)", batt)
+    net = sh("dumpsys connectivity | grep -m1 -E 'Active default network|NetworkAgentInfo'", check=False)
+    info = {
+        "data_hora": now_str(),
+        "fabricante": getprop("ro.product.manufacturer"),
+        "modelo": getprop("ro.product.model"),
+        "device": getprop("ro.product.device"),
+        "android": getprop("ro.build.version.release"),
+        "api": getprop("ro.build.version.sdk"),
+        "build": getprop("ro.build.display.id"),
+        "patch_seguranca": getprop("ro.build.version.security_patch"),
+        "abi": getprop("ro.product.cpu.abi"),
+        "idioma": getprop("persist.sys.locale") or getprop("ro.product.locale"),
+        "fuso_device": getprop("persist.sys.timezone"),
+        "tela": f"{size} @ {dens}dpi",
+        "bateria": f"{lvl.group(1)}%" if lvl else "?",
+        "rede": net[:160],
+        "apps": {p: app_version(p) for p in targets()},
+    }
+    md = ["# About Device", ""] + [f"- **{k}:** {v}" for k, v in info.items() if k != "apps"]
+    md += ["", "## Apps alvo"] + [f"- `{p}`: {v or 'não instalado'}" for p, v in info["apps"].items()]
+    text = "\n".join(md) + "\n"
+    if out_dir:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        (out_dir / "about-device.md").write_text(text)
+        (out_dir / "about-device.json").write_text(json.dumps(info, indent=2, ensure_ascii=False))
+        print(f"salvo em {out_dir}/about-device.md")
+    print(text)
+
+
+# ------------------------------------------------------------------ prep/restore
+def cmd_prep(_):
+    """Prepara o device para gravação limpa e privada. Tudo é desfeito com `restore`."""
+    done = []
+    remember("global.stay_on_while_plugged_in", setting_get("global", "stay_on_while_plugged_in"))
+    setting_put("global", "stay_on_while_plugged_in", "7")
+    done.append("tela acesa enquanto conectado")
+    remember("system.screen_off_timeout", setting_get("system", "screen_off_timeout"))
+    setting_put("system", "screen_off_timeout", "600000")
+    done.append("timeout de tela 10 min")
+    if CFG.get("SHOW_TOUCHES", "1") == "1":
+        remember("system.show_touches", setting_get("system", "show_touches"))
+        setting_put("system", "show_touches", "1")
+        done.append("mostrar toques (bom para vídeos)")
+    if CFG.get("USE_DND", "1") == "1":
+        remember("global.zen_mode", setting_get("global", "zen_mode"))
+        sh("cmd notification set_dnd priority", check=False)
+        done.append("Não perturbe (evita notificações pessoais nas evidências)")
+    if CFG.get("MUTE_MEDIA", "1") == "1":
+        m = re.search(r"volume is (\d+)", sh("cmd media_session volume --stream 3 --get", check=False))
+        if m:
+            remember("media_volume", m.group(1))
+            sh("cmd media_session volume --stream 3 --set 0", check=False)
+            done.append("volume de mídia 0")
+    sh("input keyevent KEYCODE_WAKEUP", check=False)
+    print("Preparado:\n- " + "\n- ".join(done))
+    print("Lembre: desbloqueie o device. Desfaça tudo com `droid restore`.")
+
+
+def cmd_restore(_):
+    st = load_state()
+    orig = st.get("originals", {})
+    for key, val in orig.items():
+        if key == "global.zen_mode":
+            sh("cmd notification set_dnd " + ("off" if val in (None, "0") else "priority"), check=False)
+        elif key == "media_volume":
+            sh(f"cmd media_session volume --stream 3 --set {val}", check=False)
+        elif key == "ui.night":
+            sh(f"cmd uimode night {val or 'no'}", check=False)
+        elif key == "battery":
+            sh("dumpsys battery reset", check=False)
+        elif key == "rotation":
+            a, r = (val or "1|0").split("|")
+            setting_put("system", "user_rotation", r)
+            setting_put("system", "accelerometer_rotation", a)
+        elif "." in key:
+            ns, k = key.split(".", 1)
+            setting_put(ns, k, val)
+        print(f"restaurado {key} -> {val}")
+    st["originals"] = {}
+    save_state(st)
+    for kind in ("rec", "log"):
+        if st.get(kind):
+            print(f"! Ainda há {kind} ativo: rode `droid {kind} stop`.")
+    print("Device restaurado.")
+
+
+# ------------------------------------------------------------------- screen/ui
+def cmd_shot(args):
+    if not args:
+        die("uso: droid shot <arquivo.png>")
+    path = Path(args[0])
+    path.parent.mkdir(parents=True, exist_ok=True)
+    data = adb("exec-out", "screencap", "-p", binary=True)
+    if not data.startswith(b"\x89PNG"):
+        die("screencap não retornou PNG (tela segura/FLAG_SECURE? device bloqueado?)")
+    path.write_bytes(data)
+    print(f"shot {path}")
+
+
+def parse_bounds(b):
+    n = list(map(int, re.findall(r"\d+", b)))
+    return n if len(n) == 4 else [0, 0, 0, 0]
+
+
+def cmd_ui(args):
+    show_all = "--all" in args
+    grep = args[args.index("--grep") + 1].lower() if "--grep" in args else None
+    sh("uiautomator dump /sdcard/droid_ui.xml", check=False, timeout=30)
+    xml = adb("exec-out", "cat", "/sdcard/droid_ui.xml", binary=True)
+    sh("rm -f /sdcard/droid_ui.xml", check=False)
+    try:
+        root = ET.fromstring(xml)
+    except ET.ParseError:
+        die("não consegui ler o dump (tela animando/vídeo? tente de novo).")
+    STATE_DIR.mkdir(exist_ok=True)
+    (STATE_DIR / "ui.xml").write_bytes(xml)
+    els = []
+    for n in root.iter("node"):
+        a = n.attrib
+        text, desc = a.get("text", ""), a.get("content-desc", "")
+        rid = a.get("resource-id", "").split("/")[-1]
+        clickable = a.get("clickable") == "true" or a.get("long-clickable") == "true"
+        editable = "EditText" in a.get("class", "")
+        if not show_all and not (text or desc or clickable or editable):
+            continue
+        x1, y1, x2, y2 = parse_bounds(a.get("bounds", ""))
+        if x2 <= x1 or y2 <= y1:
+            continue
+        el = {
+            "i": len(els), "cls": a.get("class", "").split(".")[-1], "text": text, "desc": desc,
+            "id": rid, "pkg": a.get("package", ""), "x": (x1 + x2) // 2, "y": (y1 + y2) // 2,
+            "bounds": [x1, y1, x2, y2], "click": clickable, "enabled": a.get("enabled") == "true",
+            "checked": a.get("checked") == "true", "focused": a.get("focused") == "true",
+        }
+        els.append(el)
+    (STATE_DIR / "ui.json").write_text(json.dumps(els, ensure_ascii=False))
+    for e in els:
+        line = f"[{e['i']:>3}] {e['cls']:<14} ({e['x']},{e['y']})"
+        if e["text"]:
+            line += f" text={e['text']!r}"
+        if e["desc"]:
+            line += f" desc={e['desc']!r}"
+        if e["id"]:
+            line += f" id={e['id']}"
+        flags = [f for f, v in (("click", e["click"]), ("disabled", not e["enabled"]),
+                                ("checked", e["checked"]), ("focused", e["focused"])) if v]
+        if flags:
+            line += " " + ",".join(flags)
+        if grep and grep not in line.lower():
+            continue
+        print(line)
+    print(f"-- {len(els)} elementos; pacote em foco: {els[0]['pkg'] if els else '?'}")
+
+
+def cmd_tap(args):
+    if len(args) != 2:
+        die("uso: droid tap X Y")
+    sh(f"input tap {int(args[0])} {int(args[1])}")
+    print(f"tap {args[0]},{args[1]}")
+
+
+def cmd_tap_el(args):
+    f = STATE_DIR / "ui.json"
+    if not f.exists() or not args:
+        die("rode `droid ui` antes; uso: droid tap-el N [--long]")
+    els = json.loads(f.read_text())
+    e = els[int(args[0])]
+    if "--long" in args:
+        sh(f"input swipe {e['x']} {e['y']} {e['x']} {e['y']} 800")
+    else:
+        sh(f"input tap {e['x']} {e['y']}")
+    print(f"tap [{e['i']}] {e['text'] or e['desc'] or e['id']} @ {e['x']},{e['y']}")
+
+
+def cmd_swipe(args):
+    if len(args) not in (4, 5):
+        die("uso: droid swipe X1 Y1 X2 Y2 [ms]")
+    ms = args[4] if len(args) == 5 else "300"
+    sh(f"input swipe {' '.join(str(int(a)) for a in args[:4])} {int(ms)}")
+    print("swipe ok")
+
+
+def cmd_text(args):
+    t = " ".join(args)
+    if any(ord(c) > 127 for c in t):
+        die("`input text` não suporta acentos/emoji. Use a ferramenta de digitação do mobile-mcp ou digite pelo teclado na tela.")
+    esc = "".join("%s" if c == " " else ("\\" + c if c in "\\\"'`$&|;<>()*?!#~{}[]" else c) for c in t)
+    sh(f"input text {esc}")
+    print(f"digitado {t!r}")
+
+
+def cmd_key(args):
+    if not args:
+        die("uso: droid key BACK|HOME|APP_SWITCH|ENTER|...")
+    k = args[0].upper()
+    sh(f"input keyevent {k if k.startswith('KEYCODE_') or k.isdigit() else 'KEYCODE_' + k}")
+    print(f"key {k}")
+
+
+# --------------------------------------------------------------------- app ops
+def cmd_launch(args):
+    pkg = default_pkg(args[0] if args else None)
+    sh(f"monkey -p {shlex.quote(pkg)} -c android.intent.category.LAUNCHER 1", check=False)
+    time.sleep(1.5)
+    cmd_focus([])
+
+
+def cmd_stop(args):
+    pkg = default_pkg(args[0] if args else None)
+    sh(f"am force-stop {shlex.quote(pkg)}")
+    print(f"force-stop {pkg}")
+
+
+def cmd_clear(args):
+    pkg = default_pkg(args[0] if args else None)
+    if pkg not in targets():
+        die(f"{pkg} não está em TARGET_PACKAGES; não vou apagar dados de outro app.")
+    print(sh(f"pm clear {shlex.quote(pkg)}"))
+
+
+def cmd_bg(args):
+    sh("input keyevent KEYCODE_HOME")
+    print("app em segundo plano (HOME)")
+
+
+def cmd_kill_bg(args):
+    """Simula morte de processo pelo sistema (app em background é morto, estado deve ser restaurado)."""
+    pkg = default_pkg(args[0] if args else None)
+    sh("input keyevent KEYCODE_HOME")
+    time.sleep(1.5)
+    sh(f"am kill {shlex.quote(pkg)}")
+    print(f"HOME + am kill {pkg}. Volte pelo Recentes (`droid key APP_SWITCH`) para testar a restauração de estado.")
+
+
+def cmd_focus(_):
+    out = sh("dumpsys window | grep -E 'mCurrentFocus|mFocusedApp' | head -2", check=False)
+    print(out)
+
+
+# ------------------------------------------------------------------ rec / log
+def _alive(pid):
+    try:
+        os.kill(pid, 0)
+        return True
+    except (OSError, TypeError):
+        return False
+
+
+def cmd_rec(args):
+    st = load_state()
+    if not args or args[0] not in ("start", "stop", "status"):
+        die("uso: droid rec start <arq.mp4> [--limit 180] | stop | status")
+    if args[0] == "status":
+        print(st.get("rec") or "sem gravação")
+        return
+    if args[0] == "start":
+        if st.get("rec"):
+            die("já há gravação ativa; `droid rec stop` primeiro")
+        if len(args) < 2:
+            die("informe o arquivo .mp4 de destino")
+        local = str(Path(args[1]).resolve())
+        limit = args[args.index("--limit") + 1] if "--limit" in args else "180"
+        remote = f"/sdcard/droid_rec_{int(time.time())}.mp4"
+        p = subprocess.Popen(adb_base() + ["shell", f"screenrecord --time-limit {int(limit)} --bugreport {remote}"],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+        st["rec"] = {"pid": p.pid, "remote": remote, "local": local, "start": time.time(), "limit": int(limit)}
+        save_state(st)
+        print(f"gravando -> {local} (máx {limit}s; sem áudio; --bugreport adiciona data/hora no vídeo)")
+        return
+    rec = st.get("rec")
+    if not rec:
+        die("nenhuma gravação ativa")
+    sh("pkill -INT screenrecord", check=False)
+    for _ in range(20):
+        if not _alive(rec["pid"]):
+            break
+        time.sleep(0.5)
+    time.sleep(1.5)  # deixa o mp4 fechar
+    Path(rec["local"]).parent.mkdir(parents=True, exist_ok=True)
+    adb("pull", rec["remote"], rec["local"], check=False)
+    sh(f"rm -f {rec['remote']}", check=False)
+    dur = time.time() - rec["start"]
+    st.pop("rec", None)
+    save_state(st)
+    warn = " (atingiu o limite: o final pode ter sido cortado)" if dur >= rec["limit"] else ""
+    print(f"vídeo salvo {rec['local']} ~{dur:.0f}s{warn}")
+
+
+def cmd_log(args):
+    st = load_state()
+    if not args or args[0] not in ("start", "stop", "status"):
+        die("uso: droid log start [arq.log] | stop | status")
+    if args[0] == "status":
+        print(st.get("log") or "sem logcat")
+        return
+    if args[0] == "start":
+        if st.get("log") and _alive(st["log"]["pid"]):
+            die(f"logcat já ativo em {st['log']['file']}")
+        run = current_run()
+        default = (run / "logs" if run else ROOT / "runs") / f"logcat_{datetime.now():%H%M%S}.log"
+        f = Path(args[1]) if len(args) > 1 else default
+        f.parent.mkdir(parents=True, exist_ok=True)
+        adb("logcat", "-c", check=False)
+        fh = open(f, "w")
+        p = subprocess.Popen(adb_base() + ["logcat", "-v", "threadtime"], stdout=fh, stderr=subprocess.STDOUT,
+                             start_new_session=True)
+        st["log"] = {"pid": p.pid, "file": str(f.resolve()), "start": now_str()}
+        save_state(st)
+        print(f"logcat -> {f}")
+        return
+    lg = st.get("log")
+    if not lg:
+        die("nenhum logcat ativo")
+    try:
+        os.kill(lg["pid"], signal.SIGTERM)
+    except OSError:
+        pass
+    st.pop("log", None)
+    save_state(st)
+    print(f"logcat parado: {lg['file']}")
+    _scan_log(Path(lg["file"]))
+
+
+def _scan_log(path):
+    if not path.exists():
+        return
+    pats = re.compile(r"FATAL EXCEPTION|ANR in|AndroidRuntime: |has died|Fatal signal|StrictMode|E/.*Exception")
+    hits = [l for l in path.read_text(errors="replace").splitlines() if pats.search(l)]
+    pk = targets()
+    rel = [l for l in hits if not pk or any(p in l for p in pk) or "FATAL" in l or "ANR in" in l]
+    print(f"{len(rel)} linhas suspeitas (crash/ANR/exceção). Primeiras:")
+    for l in rel[:15]:
+        print("  ", l[:220])
+
+
+def cmd_crashes(_):
+    out = adb("logcat", "-b", "crash", "-d", "-v", "threadtime", check=False)
+    print(out.strip()[-6000:] or "buffer de crash vazio")
+    anr = sh("ls -t /data/anr 2>/dev/null | head -3", check=False)
+    if anr:
+        print("ANR traces:", anr)
+
+
+# ------------------------------------------------------------------- settings
+def cmd_set(args):
+    if len(args) < 2:
+        die("uso: droid set dark on|off | font 1.3|reset | battery 15|reset | rotate 0|1|2|3|auto | anim off|reset")
+    what, val = args[0], args[1]
+    if what == "dark":
+        remember("ui.night", re.sub(r".*: ", "", sh("cmd uimode night", check=False)))
+        sh(f"cmd uimode night {'yes' if val == 'on' else 'no'}")
+    elif what == "font":
+        remember("system.font_scale", setting_get("system", "font_scale"))
+        setting_put("system", "font_scale", "1.0" if val == "reset" else val)
+    elif what == "battery":
+        remember("battery", "reset")
+        sh("dumpsys battery reset" if val == "reset" else f"dumpsys battery unplug && dumpsys battery set level {int(val)}")
+    elif what == "rotate":
+        remember("rotation", f"{setting_get('system', 'accelerometer_rotation') or '1'}|{setting_get('system', 'user_rotation') or '0'}")
+        if val == "auto":
+            setting_put("system", "accelerometer_rotation", "1")
+        else:
+            setting_put("system", "accelerometer_rotation", "0")
+            setting_put("system", "user_rotation", str(int(val)))
+    elif what == "anim":
+        for k in ("window_animation_scale", "transition_animation_scale", "animator_duration_scale"):
+            remember(f"global.{k}", setting_get("global", k))
+            setting_put("global", k, "0" if val == "off" else "1")
+    else:
+        die(f"ajuste desconhecido: {what}")
+    print(f"{what} = {val} (desfaça com `droid restore`)")
+
+
+def cmd_perm(args):
+    if len(args) < 2 or args[0] not in ("grant", "revoke"):
+        die("uso: droid perm grant|revoke android.permission.X [pkg]")
+    pkg = default_pkg(args[2] if len(args) > 2 else None)
+    if pkg not in targets():
+        die("só altero permissões de pacotes em TARGET_PACKAGES")
+    sh(f"pm {args[0]} {shlex.quote(pkg)} {shlex.quote(args[1])}")
+    print(f"{args[0]} {args[1]} em {pkg}")
+
+
+# ----------------------------------------------------------------------- notes
+def cmd_note(args):
+    step = None
+    if "--step" in args:
+        i = args.index("--step")
+        step = Path(args[i + 1])
+        args = args[:i] + args[i + 2:]
+    target = step or current_run()
+    if not target:
+        die("sem run atual: `droid run new <slug>` ou use --step DIR")
+    target.mkdir(parents=True, exist_ok=True)
+    with open(target / "notes.md", "a") as f:
+        f.write(f"- [{now_str()}] {' '.join(args)}\n")
+    print(f"nota -> {target / 'notes.md'}")
+
+
+CMDS = {
+    "doctor": cmd_doctor, "run": cmd_run, "info": cmd_info, "prep": cmd_prep, "restore": cmd_restore,
+    "shot": cmd_shot, "ui": cmd_ui, "tap": cmd_tap, "tap-el": cmd_tap_el, "swipe": cmd_swipe,
+    "text": cmd_text, "key": cmd_key, "launch": cmd_launch, "stop": cmd_stop, "clear": cmd_clear,
+    "bg": cmd_bg, "kill-bg": cmd_kill_bg, "focus": cmd_focus, "rec": cmd_rec, "log": cmd_log,
+    "crashes": cmd_crashes, "set": cmd_set, "perm": cmd_perm, "note": cmd_note,
+}
+
+if __name__ == "__main__":
+    if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help", "help") or sys.argv[1] not in CMDS:
+        print(__doc__)
+        sys.exit(0 if len(sys.argv) >= 2 and sys.argv[1] in ("-h", "--help", "help") else 1)
+    sys.exit(CMDS[sys.argv[1]](sys.argv[2:]) or 0)

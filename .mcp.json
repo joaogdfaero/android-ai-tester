@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "mobile-mcp": {
+      "command": "bash",
+      "args": [
+        "-c",
+        "if [ \"$(node -p 'process.versions.node.split(`.`)[0]' 2>/dev/null || echo 0)\" -ge 20 ]; then exec npx -y @mobilenext/mobile-mcp@1.0.16; else exec npx -y -p node@22 -p @mobilenext/mobile-mcp@1.0.16 mobile-mcp; fi"
+      ]
+    }
+  }
+}
